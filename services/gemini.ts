@@ -1,4 +1,3 @@
-
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { ChatMessage, Language, HoroscopeData, PorondamData, ApiKey } from "../types";
 import { doc, getDoc, updateDoc } from "firebase/firestore";
@@ -6,7 +5,8 @@ import { db } from "../lib/firebase";
 
 /**
  * HADAHANA AI Service Layer
- * PRODUCTION-GRADE KEY ROTATION SYSTEM
+ * FIXED: ReferenceError Resolved (GoogleGenAI -> GoogleGenerativeAI)
+ * MODEL: gemini-2.0-flash-exp
  */
 
 const SYSTEM_INSTRUCTION = `
@@ -94,8 +94,6 @@ const getBestApiKey = async (): Promise<ApiKey | null> => {
 // Helper: Update key usage stats (Usage Count + Last Used Time)
 const updateKeySuccess = async (targetKey: string) => {
   try {
-    // Note: We read-modify-write here. In high concurrency, Firestore transactions are better,
-    // but for this scale, this logic is sufficient.
     const docRef = doc(db, "settings", "global_config");
     const docSnap = await getDoc(docRef);
     if (!docSnap.exists()) return;
@@ -115,7 +113,7 @@ const updateKeySuccess = async (targetKey: string) => {
 
     await updateDoc(docRef, { apiKeys: updatedKeys });
   } catch (e) {
-    console.warn("Could not update key usage stats (likely permission issue for non-admin)", e);
+    console.warn("Could not update key usage stats", e);
   }
 };
 
@@ -132,8 +130,8 @@ const handleKeyRateLimited = async (targetKey: string) => {
       if (k.key === targetKey) {
         return {
           ...k,
-          // Set cooldown for 60 seconds
-          reactivateAt: Date.now() + 60000 
+          // Set cooldown for 12 Hours (Safe for Daily Limit)
+          reactivateAt: Date.now() + (12 * 60 * 60 * 1000) 
         };
       }
       return k;
@@ -141,7 +139,7 @@ const handleKeyRateLimited = async (targetKey: string) => {
 
     await updateDoc(docRef, { apiKeys: updatedKeys });
   } catch (e) {
-    console.warn("Could not set key cooldown (likely permission issue)", e);
+    console.warn("Could not set key cooldown", e);
   }
 };
 
@@ -150,7 +148,7 @@ const handleKeyRateLimited = async (targetKey: string) => {
  * Handles Key Selection, Rotation, and Retries automatically.
  */
 async function withKeyRotation<T>(
-  operation: (ai: GoogleGenAI) => Promise<T>,
+  operation: (ai: GoogleGenerativeAI) => Promise<T>,
   attempt = 1
 ): Promise<T> {
   // 1. Get Key
@@ -158,14 +156,15 @@ async function withKeyRotation<T>(
   
   if (!apiKeyData) {
     // Fallback to env if no DB keys
-    if (process.env.API_KEY) {
-       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    if (import.meta.env.VITE_GEMINI_API_KEY) {
+       const ai = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY);
        return operation(ai);
     }
     throw new Error("Service Overloaded: No available API keys found.");
   }
 
-  const ai = new GoogleGenAI({ apiKey: apiKeyData.key });
+  // FIXED: Changed 'GoogleGenAI' to 'GoogleGenerativeAI'
+  const ai = new GoogleGenerativeAI(apiKeyData.key);
 
   try {
     // 2. Try Operation
@@ -178,8 +177,8 @@ async function withKeyRotation<T>(
   } catch (error: any) {
     // 4. Error Handling
     
-    // Check for Rate Limit (429) or Quota Exceeded
-    if (error.message?.includes('429') || error.message?.includes('429') || error.status === 429) {
+    // Check for Rate Limit (429) or Quota Exceeded (403)
+    if (error.message?.includes('429') || error.status === 429 || error.status === 403) {
       // Mark this key as 'cooldown'
       await handleKeyRateLimited(apiKeyData.key);
       
@@ -206,7 +205,7 @@ export const analyzeHoroscopeAdvanced = async (
     
     // Prepare history
     const contents = history.map(msg => ({
-      role: msg.role,
+      role: msg.role === 'user' ? 'user' : 'model',
       parts: [
         { text: msg.text },
         ...(msg.images || []).map(img => ({
@@ -217,6 +216,20 @@ export const analyzeHoroscopeAdvanced = async (
         }))
       ]
     }));
+
+    // If first message is model, remove it (Gemini constraint)
+    if (contents.length > 0 && contents[0].role === 'model') {
+        contents.shift();
+    }
+
+    const model = ai.getGenerativeModel({ 
+        model: "gemini-2.0-flash-exp",
+        systemInstruction: SYSTEM_INSTRUCTION
+    });
+
+    const chat = model.startChat({
+        history: contents
+    });
 
     // Prepare current message
     const currentParts: any[] = [];
@@ -242,22 +255,15 @@ export const analyzeHoroscopeAdvanced = async (
       text: `${systemContext}\n\n${langInstruction}\n\nපරිශීලකයාගේ වත්මන් පණිවිඩය: ${userMessage}` 
     });
 
-    contents.push({ role: 'user', parts: currentParts });
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash-exp',
-      contents: contents,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        temperature: 0.5,
-        topP: 0.95,
-        topK: 40,
-      }
-    });
-
-    let cleanText = response.text || "සන්නිවේදනයේ දෝෂයක් ඇති විය.";
-    cleanText = cleanText.replace(/```html/g, '').replace(/```/g, '');
-    return cleanText;
+    try {
+        const result = await chat.sendMessage(currentParts);
+        const response = await result.response;
+        let cleanText = response.text() || "සන්නිවේදනයේ දෝෂයක් ඇති විය.";
+        cleanText = cleanText.replace(/```html/g, '').replace(/```/g, '');
+        return cleanText;
+    } catch (e) {
+        throw e; // Let wrapper handle retry
+    }
   });
 };
 
@@ -266,12 +272,14 @@ export const getHoroscopeReading = async (data: HoroscopeData, lang: Language): 
     const langInstruction = lang === 'si' ? "Sinhala" : "English";
     const prompt = `Language: ${langInstruction}\n\nPerform a full horoscope reading based on:\nDOB: ${data.dob}\nTime: ${data.tob}\nPlace: ${data.pob}\n\nIMPORTANT: Respond in valid HTML using the specified classes.`;
     
-    const response = await ai.models.generateContent({ 
-      model: 'gemini-2.0-flash-exp', 
-      contents: prompt,
-      config: { systemInstruction: SYSTEM_INSTRUCTION }
+    const model = ai.getGenerativeModel({ 
+        model: "gemini-2.0-flash-exp",
+        systemInstruction: SYSTEM_INSTRUCTION
     });
-    return (response.text || "Reading failed.").replace(/```html/g, '').replace(/```/g, '');
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    return (response.text() || "Reading failed.").replace(/```html/g, '').replace(/```/g, '');
   });
 };
 
@@ -280,28 +288,31 @@ export const getPorondamReading = async (data: PorondamData, lang: Language): Pr
     const langInstruction = lang === 'si' ? "Sinhala" : "English";
     const prompt = `Language: ${langInstruction}\n\nCheck Porondam compatibility for:\nGroom: ${data.groomName} (${data.groomNakshatra})\nBride: ${data.brideName} (${data.brideNakshatra})\n\nIMPORTANT: Respond in valid HTML using the specified classes.`;
     
-    const response = await ai.models.generateContent({ 
-      model: 'gemini-2.0-flash-exp', 
-      contents: prompt,
-      config: { systemInstruction: SYSTEM_INSTRUCTION }
+    const model = ai.getGenerativeModel({ 
+        model: "gemini-2.0-flash-exp",
+        systemInstruction: SYSTEM_INSTRUCTION
     });
-    return (response.text || "Compatibility check failed.").replace(/```html/g, '').replace(/```/g, '');
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    return (response.text() || "Compatibility check failed.").replace(/```html/g, '').replace(/```/g, '');
   });
 };
 
 export const analyzeAncientManuscript = async (image: string, lang: Language): Promise<string> => {
   return withKeyRotation(async (ai) => {
     const langInstruction = lang === 'si' ? "Sinhala" : "English";
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash-exp',
-      contents: {
-        parts: [
-          { inlineData: { mimeType: 'image/jpeg', data: image.split(',')[1] } },
-          { text: `Language: ${langInstruction}\n\nAnalyze this manuscript.\nIMPORTANT: Respond in valid HTML using the specified classes.` }
-        ]
-      },
-      config: { systemInstruction: SYSTEM_INSTRUCTION }
+    const model = ai.getGenerativeModel({ 
+        model: "gemini-2.0-flash-exp",
+        systemInstruction: SYSTEM_INSTRUCTION
     });
-    return (response.text || "Manuscript analysis failed.").replace(/```html/g, '').replace(/```/g, '');
+
+    const result = await model.generateContent([
+        { inlineData: { mimeType: 'image/jpeg', data: image.split(',')[1] } },
+        { text: `Language: ${langInstruction}\n\nAnalyze this manuscript.\nIMPORTANT: Respond in valid HTML using the specified classes.` }
+    ]);
+
+    const response = await result.response;
+    return (response.text() || "Manuscript analysis failed.").replace(/```html/g, '').replace(/```/g, '');
   });
 };
